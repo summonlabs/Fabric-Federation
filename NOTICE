@@ -1,0 +1,13 @@
+Fabric Federation
+Copyright 2026 Summon Software Labs.
+
+This product includes software developed at Summon Software Labs
+(https://github.com/summonlabs).
+
+The implementation is original work; it contains no third-party run-time
+dependencies beyond the C++20 standard library and the platform's own
+socket/persistence APIs. Component versions of third-party build tools
+(CMake, Ninja, MSVC) are recorded in docs/environment.md for reproducibility
+and are not distributed with this repository.
+
+No telemetry is transmitted by this software.

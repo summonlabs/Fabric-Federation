@@ -1,0 +1,67 @@
+# Build outputs
+build/
+build-*/
+out/
+install/
+_install/
+_fresh/
+consumer/build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+*.obj
+*.o
+*.lib
+*.a
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.gcda
+*.gcno
+*.gcov
+
+# Sanitizer / analysis artifacts
+*.su
+*.log
+core
+core.*
+*.dmp
+crash-*
+
+# Generated runtime state (never part of the repository)
+*.fedstate
+*.fedstate.tmp
+*.fedjournal
+*.fedlease
+*.ffedrun
+scratch/
+tmp/
+temp/
+_scratch/
+*.ready
+
+# IDE / editor
+.vs/
+.vscode/
+.idea/
+*.user
+*.swp
+*~
+.vsconfig
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Toolchain
+compile_commands.json
+.ninja_deps
+.ninja_log
