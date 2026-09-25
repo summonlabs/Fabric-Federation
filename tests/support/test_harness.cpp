@@ -2,6 +2,7 @@
 // Copyright 2026 Summon Software Labs.
 #include "test_harness.hpp"
 
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -138,6 +139,11 @@ int run_all(int argc, char* argv[]) {
   for (const TestCase& test : selected) {
     std::printf("[ RUN  ] %s.%s\n", test.suite.c_str(), test.name.c_str());
     std::fflush(stdout);
+    // Elapsed time per case is reported so that a slow case is visible in the
+    // output rather than hidden in the suite total. It is a measurement, not a
+    // limit: nothing here stops a case, and a case that never returns is a
+    // defect to diagnose.
+    const auto started = std::chrono::steady_clock::now();
     g_current_failed = false;
     try {
       test.fn();
@@ -153,11 +159,14 @@ int run_all(int argc, char* argv[]) {
       g_current_failed = true;
       ++g_failures;
     }
+    const double elapsed_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started)
+            .count();
     if (g_current_failed) {
       ++failed_tests;
-      std::printf("[ FAIL ] %s.%s\n", test.suite.c_str(), test.name.c_str());
+      std::printf("[ FAIL ] %s.%s (%.1f ms)\n", test.suite.c_str(), test.name.c_str(), elapsed_ms);
     } else {
-      std::printf("[  OK  ] %s.%s\n", test.suite.c_str(), test.name.c_str());
+      std::printf("[  OK  ] %s.%s (%.1f ms)\n", test.suite.c_str(), test.name.c_str(), elapsed_ms);
     }
     std::fflush(stdout);
   }

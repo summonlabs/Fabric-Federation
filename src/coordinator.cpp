@@ -449,14 +449,22 @@ void FederationCoordinator::Impl::decide_locked(std::vector<Artifact>& issued) {
       }
     }
 
+    // One pass over the evidence set builds the per-member view. Scanning the
+    // whole set once per member per pass made this quadratic in the size of the
+    // federation, which showed up as minutes of runtime under an instrumented
+    // build.
+    std::map<MemberId, std::vector<Artifact>> by_subject;
+    for (const Artifact& artifact : artifacts) {
+      if (!artifact.envelope.subject.is_nil()) {
+        by_subject[artifact.envelope.subject].push_back(artifact);
+      }
+    }
+
     std::vector<Artifact> batch;
     for (const MemberState& member : state.members) {
-      std::vector<Artifact> for_member;
-      for (const Artifact& artifact : artifacts) {
-        if (artifact.envelope.subject == member.member) {
-          for_member.push_back(artifact);
-        }
-      }
+      const auto bucket = by_subject.find(member.member);
+      const std::vector<Artifact> for_member =
+          bucket == by_subject.end() ? std::vector<Artifact>{} : bucket->second;
       MembershipContext context;
       context.federation = config.federation;
       context.current_epoch = state.epoch;

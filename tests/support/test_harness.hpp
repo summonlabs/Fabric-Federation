@@ -120,11 +120,16 @@ void announce_seed();
     }                                                                          \
   } while (false)
 
+// The operands are taken *by value*, not by reference. Binding a reference to a
+// member of a temporary (for example `state().value().partition.state`) does not
+// extend that temporary's lifetime, so the reference would dangle as soon as the
+// declaration statement ended. AddressSanitizer found exactly that here; copying
+// while the temporary is still alive is the fix.
 #define FFED_CHECK_EQ(actual, expected)                                                  \
   do {                                                                                   \
     ::ffed_test::record_check();                                                         \
-    const auto& ffed_actual_value = (actual);                                            \
-    const auto& ffed_expected_value = (expected);                                        \
+    const auto ffed_actual_value = (actual);                                             \
+    const auto ffed_expected_value = (expected);                                         \
     if (!(ffed_actual_value == ffed_expected_value)) {                                   \
       ::ffed_test::record_failure(__FILE__, __LINE__,                                    \
                                   "CHECK_EQ failed: " #actual " == " #expected           \

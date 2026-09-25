@@ -13,6 +13,7 @@
 #include "test_harness.hpp"
 
 #include <filesystem>
+#include <thread>
 
 using namespace fabric_federation;
 
@@ -98,12 +99,26 @@ std::vector<std::byte> craft_frame(std::uint32_t length, std::uint32_t magic,
                                    std::uint32_t payload_length,
                                    const std::vector<std::byte>& payload,
                                    bool correct_digest) {
-  std::vector<std::byte> frame(4 + length, std::byte{0});
-  store_u32_le(frame.data(), length);
-  store_u32_le(frame.data() + 4, magic);
-  std::memcpy(frame.data() + 8, &version, 2);
-  std::memcpy(frame.data() + 10, &type, 2);
-  store_u32_le(frame.data() + 12, payload_length);
+  // Every field is written only when the frame is actually large enough to
+  // hold it. `length` is attacker-controlled in this helper, so a frame may be
+  // shorter than the header it claims; writing past its end would corrupt the
+  // heap and make the test itself the defect.
+  std::vector<std::byte> frame(static_cast<std::size_t>(4) + length, std::byte{0});
+  const auto write_u32 = [&frame](std::size_t offset, std::uint32_t value) {
+    if (offset + 4 <= frame.size()) {
+      store_u32_le(frame.data() + offset, value);
+    }
+  };
+  const auto write_u16 = [&frame](std::size_t offset, std::uint16_t value) {
+    if (offset + 2 <= frame.size()) {
+      std::memcpy(frame.data() + offset, &value, 2);
+    }
+  };
+  write_u32(0, length);
+  write_u32(4, magic);
+  write_u16(8, version);
+  write_u16(10, type);
+  write_u32(12, payload_length);
   if (!payload.empty() && frame.size() >= 16 + payload.size()) {
     std::memcpy(frame.data() + 16, payload.data(), payload.size());
   }
@@ -241,8 +256,13 @@ FFED_TEST(protocol, hostile_frames_are_refused) {
     FFED_REQUIRE(client.value().send_all(test_case.frame).ok());
     const Status closed = client.value().shutdown_send();
     (void)closed;
+    // The peer must answer on its own: there is no timeout, so a peer that
+    // never returns is a defect to be diagnosed rather than a case to skip.
     peer.join();
-    FFED_CHECK_EQ(peer.read_status().code(), test_case.expected);
+    FFED_CHECK_MSG(peer.read_status().code() == test_case.expected,
+                   std::string(test_case.name) + ": expected " +
+                       std::string(to_string(test_case.expected)) + ", received " +
+                       std::string(to_string(peer.read_status().code())));
   }
 }
 
@@ -295,15 +315,29 @@ FFED_TEST(protocol, only_loopback_endpoints_are_accepted) {
 }
 
 FFED_TEST(protocol, control_channel_helpers_report_failure_loudly) {
-  // No daemon is listening on this port, so the readiness helper must fail
-  // rather than report success.
-  const std::uint16_t unused = 1;
+  // A refused loopback connect costs about two seconds on this machine: the SYN
+  // is retransmitted rather than answered with a reset, and this runtime has no
+  // connect timeout by design. The test therefore performs the smallest number
+  // of refused connects that still proves the contract: one through
+  // send_control_command and two through the bounded retry loop.
+  std::uint16_t unused = 0;
+  {
+    auto listener = Listener::bind_loopback(0, 4);
+    FFED_REQUIRE(listener.has_value());
+    unused = listener.value().port();
+    const Status closed = listener.value().close();
+    FFED_REQUIRE(closed.ok());
+  }
+  // Nothing is listening: the command reports a transport failure rather than a
+  // fabricated success, and the readiness helper gives up and FAILS rather than
+  // waiting forever or declaring success.
   auto reply = send_control_command(unused, "stats");
   FFED_CHECK(!reply.has_value());
-  auto waited = wait_for_control(unused, "stats", 4, 1000);
+  auto waited = wait_for_control(unused, "stats", 2, 1000);
   FFED_CHECK(!waited.has_value());
+  // A readiness file that never appears must fail too.
   auto missing_file = wait_for_ready_file(
-      std::filesystem::temp_directory_path() / "ffed-does-not-exist.ready", 4, 1000);
+      std::filesystem::temp_directory_path() / "ffed-does-not-exist.ready", 8, 1000);
   FFED_CHECK(!missing_file.has_value());
 }
 

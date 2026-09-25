@@ -61,6 +61,11 @@ struct MemberFabricRuntime::Impl {
   std::thread probe_thread;
   std::atomic<bool> probe_stopping{false};
   bool probe_open = false;
+  // The port the probe listener actually bound. When the configuration asks for
+  // an ephemeral port, the first bind chooses one and later binds reuse it, so
+  // closing and reopening the listener does not silently move the endpoint that
+  // peers are configured to reach.
+  std::uint16_t bound_probe_port = 0;
 };
 
 MemberFabricRuntime::MemberFabricRuntime() : impl_(new Impl()) {}
@@ -696,11 +701,14 @@ Status MemberFabricRuntime::start_probe_listener() {
   if (impl.probe_open) {
     return Status::success();
   }
-  auto listener = Listener::bind_loopback(impl.config.probe_port, 32);
+  const std::uint16_t requested =
+      impl.config.probe_port != 0 ? impl.config.probe_port : impl.bound_probe_port;
+  auto listener = Listener::bind_loopback(requested, 32);
   if (!listener.has_value()) {
     return listener.status();
   }
   impl.probe_listener = std::move(listener.value());
+  impl.bound_probe_port = impl.probe_listener.port();
   impl.probe_open = true;
   impl.probe_stopping.store(false, std::memory_order_release);
   impl.probe_thread = std::thread([this] {

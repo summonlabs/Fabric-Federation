@@ -109,6 +109,9 @@ std::string control_response(const std::string& line, FederationCoordinator& coo
                       " tick=" + std::to_string(stats.logical_time.value()) +
                       " incarnation=" + std::to_string(stats.coordinator_incarnation.value()) +
                       " artifacts=" + std::to_string(stats.artifacts) +
+                      " rejected=" + std::to_string(stats.rejected_artifacts) +
+                      " duplicates=" + std::to_string(stats.duplicate_artifacts) +
+                      " journal=" + std::to_string(stats.journal_records) +
                       " members=" + std::to_string(stats.members) +
                       " active=" + std::to_string(stats.active_members) +
                       " leases=" + std::to_string(stats.leases) +

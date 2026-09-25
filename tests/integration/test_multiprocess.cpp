@@ -88,6 +88,11 @@ struct Cluster {
 
   bool start_coordinator(bool bootstrap) {
     const std::filesystem::path ready = scratch->file("coordinator-" + tag + ".ready");
+    // A readiness file left behind by an earlier process at the same path would
+    // be read as if this process had written it, so it is removed first. The
+    // wait below then genuinely waits for this process.
+    std::error_code ignored;
+    std::filesystem::remove(ready, ignored);
     ProcessSpec process_spec;
     process_spec.executable = FFED_COORDINATOR_BIN;
     process_spec.arguments = {"--federation", federation, "--state", journal.string(),
@@ -125,6 +130,10 @@ struct Cluster {
                     ChildProcess& out_process, std::uint16_t& out_probe) {
     const std::filesystem::path ready =
         scratch->file("member-" + tag + "-" + std::to_string(control) + ".ready");
+    // Removed first: a restarted member reuses the control port, and therefore
+    // the readiness path, of the process it replaces.
+    std::error_code ignored;
+    std::filesystem::remove(ready, ignored);
     ProcessSpec process_spec;
     process_spec.executable = FFED_MEMBER_BIN;
     process_spec.arguments = {"--federation", federation, "--member", member, "--domain", domain,
@@ -219,8 +228,14 @@ Cluster make_cluster(Scratch& scratch, const std::string& tag,
   cluster.candidate = MemberId::derive("multiprocess-candidate", 1).to_string();
   cluster.candidate_domain =
       FabricDomainId::derive("multiprocess-candidate-domain", 1).to_string();
+  // Shared delegation with identical terms on every member. Exclusive
+  // delegation from two members of the same grant is a conflict, and the
+  // runtime withholds the grant from everyone while it stands - correct, but
+  // not what this suite is about: this suite is about leases, incarnations,
+  // partitions and restarts. Conflict containment is proved in
+  // tests/unit/test_authority.cpp and by `ffed-cli demo`.
   cluster.spec =
-      "gen=1;delegated=federation.route.advertise:mutate:exclusive;"
+      "gen=1;delegated=federation.route.advertise:mutate:shared;"
       "retained=domain.mp.control:administer;caps=federation.protocol.v1:1:known";
   cluster.journal = scratch.file("federation-" + tag + ".fedjournal");
   cluster.coordinator_control = g_port_base.fetch_add(3);
@@ -236,18 +251,68 @@ Cluster make_cluster(Scratch& scratch, const std::string& tag,
 void join_through_processes(const Cluster& cluster) {
   auto proposal = cluster.sponsor_command(
       "propose " + cluster.candidate + " " + cluster.candidate_domain + " 1 0 " + cluster.spec);
-  (void)proposal;
+  FFED_REQUIRE(proposal.has_value());
+  FFED_REQUIRE(proposal.value().rfind("OK", 0) == 0);
   auto acceptance = cluster.candidate_command("accept 0");
-  (void)acceptance;
+  FFED_REQUIRE(acceptance.has_value());
+  FFED_REQUIRE(acceptance.value().rfind("OK", 0) == 0);
   auto endorsement = cluster.sponsor_command(
       "endorse " + cluster.candidate + " " + cluster.candidate_domain + " 1 0 " + cluster.spec);
-  (void)endorsement;
+  FFED_REQUIRE(endorsement.has_value());
+  FFED_REQUIRE(endorsement.value().rfind("OK", 0) == 0);
+
+  // Reachability is evidence: each member probes the other over the transport
+  // and reports what it actually reached. Both directions must succeed, or the
+  // federation stays INDETERMINATE and nobody holds mutating authority.
   auto probe = cluster.candidate_command("probe " + cluster.sponsor + " 127.0.0.1 " +
                                          std::to_string(cluster.sponsor_probe));
-  (void)probe;
+  FFED_REQUIRE(probe.has_value());
+  FFED_CHECK_MSG(probe.value().find("REACHABLE") != std::string::npos,
+                 "the candidate could not reach the sponsor: " + probe.value());
   auto reverse = cluster.sponsor_command("probe " + cluster.candidate + " 127.0.0.1 " +
                                          std::to_string(cluster.candidate_probe));
-  (void)reverse;
+  FFED_REQUIRE(reverse.has_value());
+  FFED_CHECK_MSG(reverse.value().find("REACHABLE") != std::string::npos,
+                 "the sponsor could not reach the candidate: " + reverse.value());
+
+  auto digest = cluster.coordinator_command("digest");
+  FFED_REQUIRE(digest.has_value());
+  FFED_CHECK_MSG(digest.value().find("partition=CONNECTED") != std::string::npos,
+                 "mutually confirmed reachability did not produce a connected assessment: " +
+                     digest.value());
+  FFED_CHECK_MSG(digest.value().find("active=2") != std::string::npos,
+                 "both members should be established after the join: " + digest.value());
+}
+
+// Asks a member which port its probe listener is on. A member that restarted
+// as a new process has a new endpoint, and the peers that must confirm it have
+// to be told; that is what an operator does when a member reincarnates.
+std::uint16_t query_probe_port(const Cluster& cluster, bool sponsor) {
+  auto reply = sponsor ? cluster.sponsor_command("probe-port")
+                       : cluster.candidate_command("probe-port");
+  if (!reply.has_value() || reply.value().rfind("OK", 0) != 0) {
+    return 0;
+  }
+  return static_cast<std::uint16_t>(std::stoi(reply.value().substr(3)));
+}
+
+// Both members confirm each other over the transport and the federation must
+// agree that the active set is connected.
+void confirm_mutual_reachability(const Cluster& cluster) {
+  auto forward = cluster.candidate_command("probe " + cluster.sponsor + " 127.0.0.1 " +
+                                           std::to_string(cluster.sponsor_probe));
+  FFED_REQUIRE(forward.has_value());
+  FFED_CHECK_MSG(forward.value().find("REACHABLE") != std::string::npos,
+                 "candidate -> sponsor: " + forward.value());
+  auto backward = cluster.sponsor_command("probe " + cluster.candidate + " 127.0.0.1 " +
+                                          std::to_string(cluster.candidate_probe));
+  FFED_REQUIRE(backward.has_value());
+  FFED_CHECK_MSG(backward.value().find("REACHABLE") != std::string::npos,
+                 "sponsor -> candidate: " + backward.value());
+  auto digest = cluster.coordinator_command("digest");
+  FFED_REQUIRE(digest.has_value());
+  FFED_CHECK_MSG(digest.value().find("partition=CONNECTED") != std::string::npos,
+                 "mutual reachability did not produce a connected assessment: " + digest.value());
 }
 
 std::string extract_lease_id(const std::string& reply) {
@@ -348,6 +413,9 @@ FFED_TEST(multiprocess, a_stale_incarnation_cannot_use_the_authority_it_held) {
                                     restarted, probe));
   cluster.candidate_process = std::move(restarted);
   cluster.candidate_probe = probe;
+  FFED_REQUIRE(cluster.candidate_probe != 0);
+  // The new process reports the endpoint it is actually listening on.
+  FFED_CHECK_EQ(query_probe_port(cluster, false), cluster.candidate_probe);
 
   // The authority that was bound to incarnation 1 is fenced. The lease records
   // the identity it was issued to, so it cannot be spent by the new run.
@@ -355,6 +423,13 @@ FFED_TEST(multiprocess, a_stale_incarnation_cannot_use_the_authority_it_held) {
                                          old_lease);
   FFED_REQUIRE(stale.has_value());
   FFED_CHECK(stale.value().find("outcome=GRANTED") == std::string::npos);
+
+  // Reincarnation also invalidates the reachability evidence the other member
+  // holds: the recorded peer incarnation is the old one, so the edge is gone
+  // until the peer observes the new incarnation. This is the conservative rule
+  // doing its job, and the federation reconverges once both members confirm
+  // each other again.
+  confirm_mutual_reachability(cluster);
 
   // The member recovers by presenting new authority for its new incarnation:
   // the federation issues a fresh lease bound to incarnation 2.
@@ -427,23 +502,22 @@ FFED_TEST(multiprocess, partition_suspends_global_mutation_and_recovery_is_conse
   FFED_REQUIRE(sponsor_during_split.has_value());
   FFED_CHECK(sponsor_during_split.value().find("outcome=GRANTED") == std::string::npos);
 
-  // Recovery: the listener comes back, both members confirm each other, the
-  // federation advances to a new epoch.
+  // Recovery: the listener comes back on the same endpoint, both members
+  // confirm each other again, and the federation advances to a new epoch.
   FFED_REQUIRE(cluster.candidate_command("start-probe-listener").has_value());
-  FFED_REQUIRE(cluster.candidate_command("probe " + cluster.sponsor + " 127.0.0.1 " +
-                                         std::to_string(cluster.sponsor_probe))
-                   .has_value());
-  FFED_REQUIRE(cluster.sponsor_command("probe " + cluster.candidate + " 127.0.0.1 " +
-                                       std::to_string(cluster.candidate_probe))
-                   .has_value());
-  auto recovered_transport = cluster.coordinator_command("digest");
-  FFED_REQUIRE(recovered_transport.has_value());
-  FFED_CHECK(recovered_transport.value().find("partition=CONNECTED") != std::string::npos);
+  FFED_CHECK_EQ(query_probe_port(cluster, false), cluster.candidate_probe);
+  confirm_mutual_reachability(cluster);
 
   FFED_REQUIRE(cluster.coordinator_command("advance-epoch 2 partition recovery").has_value());
   auto reconciling = cluster.coordinator_command("digest");
   FFED_REQUIRE(reconciling.has_value());
   FFED_CHECK(reconciling.value().find("reconciling") != std::string::npos);
+
+  // An epoch advance invalidates reachability evidence recorded at the previous
+  // epoch, so the members must confirm each other again before authority can
+  // follow. This is the conservative rule, and it is what makes the recovery
+  // below meaningful rather than assumed.
+  confirm_mutual_reachability(cluster);
   auto still_fenced =
       cluster.candidate_command("authority federation.route.advertise mutate " + lease_id);
   FFED_REQUIRE(still_fenced.has_value());
@@ -496,12 +570,18 @@ FFED_TEST(multiprocess, coordinator_restart_does_not_revive_leases_or_authority)
   cluster.stop_coordinator();
 
   // A fresh coordinator process recovers the same federation from the journal.
+  // It must serve the *same* federation identity, or every recovered artefact
+  // is refused as belonging to another federation - which is exactly what the
+  // runtime is supposed to do with foreign evidence.
   Cluster restarted = make_cluster(scratch, "restart-recovered");
   restarted.journal = cluster.journal;
+  restarted.federation = cluster.federation;
   FFED_REQUIRE(restarted.start_coordinator(false));
   auto state = restarted.coordinator_command("digest");
   FFED_REQUIRE(state.has_value());
-  FFED_CHECK(state.value().find("active=2") != std::string::npos);
+  FFED_CHECK_MSG(state.value().find("active=2") != std::string::npos,
+                 "recovered federation does not hold both members as established: " +
+                     state.value());
   FFED_CHECK(state.value().find("artifacts=") != std::string::npos);
 
   // The lease survived as evidence but is bound to the previous coordinator
@@ -512,10 +592,30 @@ FFED_TEST(multiprocess, coordinator_restart_does_not_revive_leases_or_authority)
 
   // Members reattach and must obtain new authority; the old lease is refused.
   FFED_REQUIRE(restarted.start_members());
+  const std::uint16_t restarted_candidate_probe = query_probe_port(restarted, false);
+  FFED_REQUIRE(restarted_candidate_probe != 0);
+  restarted.candidate_probe = restarted_candidate_probe;
+  FFED_REQUIRE(restarted.sponsor_probe != 0);
   auto stale =
       restarted.candidate_command("authority federation.route.advertise mutate " + lease_id);
   FFED_REQUIRE(stale.has_value());
   FFED_CHECK(stale.value().find("outcome=GRANTED") == std::string::npos);
+
+  // A member whose authority was bound to the previous coordinator incarnation
+  // recovers by presenting itself again, and the federation issues new
+  // authority; the pre-restart lease stays refused.
+  auto recovered_lease = restarted.candidate_command("lease federation.route.advertise 0 5000");
+  FFED_REQUIRE(recovered_lease.has_value());
+  FFED_CHECK_MSG(recovered_lease.value().rfind("OK", 0) == 0,
+                 "a live member could not obtain fresh authority after the restart: " +
+                     recovered_lease.value());
+  const std::string recovered_lease_id = extract_lease_id(recovered_lease.value());
+  FFED_REQUIRE(!recovered_lease_id.empty());
+  FFED_CHECK(recovered_lease_id != lease_id);
+  auto still_stale =
+      restarted.candidate_command("authority federation.route.advertise mutate " + lease_id);
+  FFED_REQUIRE(still_stale.has_value());
+  FFED_CHECK(still_stale.value().find("outcome=GRANTED") == std::string::npos);
 
   restarted.shutdown();
 }

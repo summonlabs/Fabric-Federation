@@ -620,7 +620,14 @@ FFED_TEST(authority, decisions_are_deterministic_across_coordinators) {
         return Result<std::unique_ptr<FederationCoordinator>>(outcome.status());
       }
     }
-    for (const MemberObservation& observation : joined.coordinator->observations().value()) {
+    // The Result is held in a named local: iterating over `observations().value()`
+    // directly would bind the range to a member of a temporary that dies at the
+    // end of the range initialisation.
+    auto observations = joined.coordinator->observations();
+    if (!observations.has_value()) {
+      return Result<std::unique_ptr<FederationCoordinator>>(observations.status());
+    }
+    for (const MemberObservation& observation : observations.value()) {
       const Status reported = replica.value()->report_observation(observation);
       if (!reported.ok()) {
         return Result<std::unique_ptr<FederationCoordinator>>(reported);

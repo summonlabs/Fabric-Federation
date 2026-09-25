@@ -161,7 +161,9 @@ docs/                        architecture, authority model, canonical form, conc
 * [docs/limitations.md](docs/limitations.md) — what is not implemented, and what is
   therefore not claimed
 * [docs/environment.md](docs/environment.md) — the exact toolchain used for the results in
-  this repository
+  this repository, and the measured platform behaviour that shapes the tests
+* [docs/benchmarks.md](docs/benchmarks.md) — completed-work measurements, exactly as the
+  benchmark programs printed them
 
 ## Contributing
 

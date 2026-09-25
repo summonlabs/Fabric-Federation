@@ -7,7 +7,9 @@
 // callback into user code under a lock.
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -207,15 +209,24 @@ FFED_TEST(concurrency, stopping_closes_live_connections_without_hanging) {
   FFED_REQUIRE(coordinator.has_value());
   FFED_REQUIRE(coordinator.value()->start().ok());
   const std::uint16_t port = coordinator.value()->listen_port();
+  constexpr std::size_t kClients = 6;
   std::vector<std::thread> clients;
   std::atomic<std::size_t> refused{0};
   std::atomic<std::size_t> served{0};
-  for (int i = 0; i < 6; ++i) {
+  std::atomic<std::size_t> finished{0};
+  std::mutex gate_mutex;
+  std::condition_variable gate;
+  for (std::size_t i = 0; i < kClients; ++i) {
     clients.emplace_back([&, i] {
+      const auto finish = [&] {
+        finished.fetch_add(1);
+        gate.notify_all();
+      };
       auto client = CoordinatorClient::connect(Endpoint{"127.0.0.1", port}, fixture.federation,
                                                NodeId::derive("stop-client", i), Incarnation(1));
       if (!client.has_value()) {
         refused.fetch_add(1);
+        finish();
         return;
       }
       for (int k = 0; k < 200; ++k) {
@@ -225,13 +236,24 @@ FFED_TEST(concurrency, stopping_closes_live_connections_without_hanging) {
           break;
         }
         served.fetch_add(1);
+        gate.notify_all();
       }
       const Status closed = client.value().close();
       (void)closed;
+      finish();
     });
   }
-  // Let the clients connect, then stop while they are mid-conversation.
-  std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  // Wait until at least one client has actually completed a query, so the
+  // coordinator is stopped while the connections are genuinely mid-conversation.
+  // A fixed sleep would be a guess; this is a fact. The wait also ends when
+  // every client has finished, so a client that cannot be served reports a
+  // failure through the assertion below instead of hanging the suite.
+  {
+    std::unique_lock<std::mutex> lock(gate_mutex);
+    gate.wait(lock, [&] {
+      return served.load() > 0 || finished.load() == kClients;
+    });
+  }
   FFED_REQUIRE(coordinator.value()->stop().ok());
   for (std::thread& client : clients) {
     client.join();

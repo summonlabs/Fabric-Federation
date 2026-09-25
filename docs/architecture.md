@@ -100,6 +100,18 @@ state, and requires every established member to re-attest before global mutation
 The derivation re-checks that condition itself; a reconciliation record alone does not lift
 the suspension.
 
+## The probe endpoint is part of a member's identity
+
+A member's reachability endpoint is what its peers are configured to reach, so
+`MemberFabricRuntime::start_probe_listener` reuses the port it bound the first time
+whenever the configuration asks for an ephemeral one. Closing and reopening the listener —
+which is how a transport-level partition is produced for real in the tests — therefore does
+**not** silently move the endpoint. A member that restarts as a new process is a different
+matter: it reports the endpoint it actually bound, and the peers that must confirm it have
+to be told, exactly as an operator would update a peer list. The multiprocess suite queries
+each restarted member for its endpoint and re-observes it before expecting authority to
+follow.
+
 ## Threading and ownership
 
 * One state mutex guards the evidence set, the derived inputs and the journal.

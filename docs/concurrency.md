@@ -50,6 +50,40 @@ both, which makes lock inversion structurally impossible rather than merely unli
   when it is full is closed rather than queued; the worker count is bounded and validated at
   creation; `kMaxConnections` bounds the accepted set.
 
+## Slow-path observations
+
+The transport has no connect timeout by design, so a connection attempt runs until the
+operating system answers. On this machine a **refused** loopback connect costs about 2.05
+seconds, because the SYN is retransmitted rather than answered with a reset (measured
+directly; see `environment.md`). That cost is the platform's, not a wait introduced here,
+and it is why the readiness helper in `tests/unit/test_protocol.cpp` performs the smallest
+number of refused connects that still proves its contract. Nothing in the runtime or the
+tests waits on a timer.
+
+Per-case elapsed time is printed by the test harness (`[  OK  ] suite.case (12.3 ms)`). It
+is a measurement, not a limit: no case is stopped, skipped or reclassified by it.
+
+## Re-audit after the multiprocess and sanitizer fixes
+
+The following changes were made after the first audit and were re-checked against it.
+
+* **`Impl::decide_locked` now builds a per-subject index once per pass** instead of
+  scanning the whole evidence set once per member. The index is a local; it is built and
+  destroyed while the state mutex is held, and it touches no lock, no socket and no
+  callback. Lock discipline is unchanged, and the change removed an O(members × artefacts)
+  term that made the concurrency suite take minutes under instrumentation.
+* **`MemberFabricRuntime::start_probe_listener` reuses the port it bound the first time**
+  when the configuration asks for an ephemeral one. It is called from the member's control
+  thread; if the listener is already open it returns immediately, and after a
+  `stop_probe_listener` the probe thread has already been joined. There is no window in
+  which the probe thread and a rebind overlap.
+* **`concurrency.stopping_closes_live_connections_without_hanging` no longer sleeps.** It
+  waited 20 ms and hoped the clients had connected; under AddressSanitizer that guess was
+  wrong and the case failed for a reason that had nothing to do with the runtime. It now
+  waits on a condition variable for a *fact* — that at least one client has completed a
+  query — and the wait also ends when every client has finished, so a client that cannot be
+  served reports a failure instead of hanging the suite. No timeout, no sleep, no watchdog.
+
 ## Tests that exercise this
 
 `tests/unit/test_concurrency.cpp`:
