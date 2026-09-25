@@ -138,17 +138,19 @@ FFED_TEST(lifecycle, one_member_cannot_create_multiparty_authority_alone) {
   FFED_CHECK_EQ(member->lifecycle, MemberLifecycleState::Proposed);
   FFED_CHECK(member->federation_authority.empty());
   bool saw_self_proposal = false;
-  bool saw_distinct_parties = false;
+  bool saw_insufficient_evidence = false;
   for (const Reason& reason : member->reasons) {
     if (reason.code == ReasonCode::MultiPartySelfProposalRejected) {
       saw_self_proposal = true;
     }
-    if (reason.code == ReasonCode::MultiPartyInsufficientDistinctParties) {
-      saw_distinct_parties = true;
+    if (reason.code == ReasonCode::MembershipProposedInsufficientEvidence) {
+      saw_insufficient_evidence = true;
     }
   }
+  // A self-proposal is recorded and set aside: it can never be the operative
+  // proposal, so the member has no valid path to admission on its own word.
   FFED_CHECK(saw_self_proposal);
-  FFED_CHECK(saw_distinct_parties);
+  FFED_CHECK(saw_insufficient_evidence);
 
   // Asking the federation for authority anyway is refused.
   AuthorityRequest request;
