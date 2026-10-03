@@ -33,8 +33,6 @@ do not own.
   `STALE`, `CONFLICTING`, `INCOMPLETE`, `INDETERMINATE`, `REFUSED`,
   `CANCELLED` and `INVALID` must stay distinguishable, and missing evidence
   must never be converted into success.
-* Do not introduce test timeouts, watchdog "success" paths, or any mechanism
-  that classifies a hang as a pass. A hang is a defect.
 * Document what is actually implemented. Do not describe behaviour that the
   code does not have. Keep the boundaries in `docs/limitations.md` honest and
   current: this runtime does **not** implement consensus, quorum, Byzantine
