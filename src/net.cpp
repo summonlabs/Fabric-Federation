@@ -223,6 +223,10 @@ Status Socket::shutdown_both() {
   }
 #if defined(_WIN32)
   ::shutdown(to_native(handle), SD_BOTH);
+  // On Windows a shutdown does not return a receive that another thread is
+  // already blocked in when the peer is silent. Cancelling the pending I/O
+  // does, which is what makes this the coordinated-shutdown primitive.
+  ::CancelIoEx(reinterpret_cast<HANDLE>(to_native(handle)), nullptr);
 #else
   ::shutdown(to_native(handle), SHUT_RDWR);
 #endif

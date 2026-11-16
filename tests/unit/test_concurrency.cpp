@@ -9,6 +9,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -291,6 +292,102 @@ FFED_TEST(concurrency, concurrent_clients_each_get_a_welcome) {
   FFED_CHECK_EQ(welcomed.load(), kClients);
   FFED_CHECK_EQ(coordinator.value()->stats().protocol_errors, std::uint64_t{0});
   FFED_REQUIRE(coordinator.value()->stop().ok());
+}
+
+FFED_TEST(concurrency, idle_connections_do_not_keep_later_clients_waiting) {
+  // A member keeps its connection to the coordinator for as long as it runs. A federation with
+  // more connected members than the coordinator has worker threads must still serve each one.
+  const FederationFixture fixture;
+  auto coordinator = make_listening_coordinator(fixture);
+  FFED_REQUIRE(coordinator.has_value());
+  FFED_REQUIRE(coordinator.value()->start().ok());
+  const std::uint16_t port = coordinator.value()->listen_port();
+  constexpr std::size_t kClients = 10;
+  std::mutex mutex;
+  std::condition_variable changed;
+  std::vector<std::unique_ptr<CoordinatorClient>> connected(kClients);
+  std::size_t welcomed = 0;
+  bool closing = false;
+  std::vector<std::thread> threads;
+  for (std::size_t i = 0; i < kClients; ++i) {
+    threads.emplace_back([&, i] {
+      auto client = CoordinatorClient::connect(Endpoint{"127.0.0.1", port}, fixture.federation,
+                                               NodeId::derive("idle-client", i), Incarnation(1));
+      std::lock_guard<std::mutex> lock(mutex);
+      if (client.has_value()) {
+        if (closing) {
+          // Served only after the others had gone: too late to count, and not kept open.
+          const Status closed = client.value().close();
+          (void)closed;
+        } else {
+          connected[i] = std::make_unique<CoordinatorClient>(std::move(client.value()));
+          ++welcomed;
+        }
+      }
+      changed.notify_all();
+    });
+  }
+  std::size_t served = 0;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    changed.wait_for(lock, std::chrono::seconds(5), [&] { return welcomed == kClients; });
+    served = welcomed;
+    closing = true;
+    // Every connection that was served stays open and silent until here. Closing them lets a
+    // coordinator that kept the others waiting get to them, so the threads above always finish.
+    for (auto& client : connected) {
+      if (client) {
+        const Status closed = client->close();
+        (void)closed;
+      }
+    }
+  }
+  for (std::thread& thread : threads) {
+    thread.join();
+  }
+  for (auto& client : connected) {
+    if (client) {
+      const Status closed = client->close();
+      (void)closed;
+    }
+  }
+  FFED_CHECK_EQ(served, kClients);
+  FFED_REQUIRE(coordinator.value()->stop().ok());
+}
+
+FFED_TEST(concurrency, stopping_does_not_wait_for_a_silent_client) {
+  const FederationFixture fixture;
+  auto coordinator = make_listening_coordinator(fixture);
+  FFED_REQUIRE(coordinator.has_value());
+  FFED_REQUIRE(coordinator.value()->start().ok());
+  const std::uint16_t port = coordinator.value()->listen_port();
+  // A connected member that has nothing to say at the moment.
+  auto client = CoordinatorClient::connect(Endpoint{"127.0.0.1", port}, fixture.federation,
+                                           NodeId::derive("silent-client", 1), Incarnation(1));
+  FFED_REQUIRE(client.has_value());
+  FFED_REQUIRE(client.value().ping().ok());
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool stopped = false;
+  std::thread stopper([&] {
+    const Status status = coordinator.value()->stop();
+    (void)status;
+    std::lock_guard<std::mutex> lock(mutex);
+    stopped = true;
+    changed.notify_all();
+  });
+  bool prompt = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    prompt = changed.wait_for(lock, std::chrono::seconds(5), [&] { return stopped; });
+  }
+  // A coordinator that was still waiting for the client is released by the client going away.
+  const Status closed = client.value().close();
+  (void)closed;
+  stopper.join();
+  FFED_CHECK(prompt);
+  FFED_CHECK(!coordinator.value()->running());
 }
 
 FFED_TEST_MAIN()

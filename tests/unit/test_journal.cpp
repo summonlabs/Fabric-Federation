@@ -398,4 +398,88 @@ FFED_TEST(journal, revocation_and_replay_ledger_survive_a_restart) {
   }
 }
 
+FFED_TEST(journal, appending_stops_at_the_record_bound_recovery_enforces) {
+  // Recovery refuses a journal that holds more records than the bound. Appending therefore has
+  // to stop at that bound, or the runtime writes a journal it will not open again.
+  Scratch scratch;
+  const auto path = scratch.file("record-bound.fedjournal");
+  JournalOptions options;
+  options.max_records = 8;
+  const std::vector<std::byte> payload(16, std::byte{7});
+  {
+    auto journal = Journal::open(path, JournalOpenMode::CreateTruncating, options);
+    FFED_REQUIRE(journal.has_value());
+    for (int i = 0; i < 8; ++i) {
+      FFED_REQUIRE(journal.value().append(JournalRecordType::TickHighWater, payload).ok());
+    }
+    FFED_CHECK_EQ(journal.value().append(JournalRecordType::TickHighWater, payload).code(),
+                  ErrorCode::CapacityExceeded);
+    // What was appended through this handle is part of the history it reads back.
+    auto records = journal.value().load(64, 64);
+    FFED_REQUIRE(records.has_value());
+    FFED_CHECK_EQ(records.value().size(), std::size_t{8});
+    FFED_REQUIRE(journal.value().close().ok());
+  }
+  auto reopened = Journal::open(path, JournalOpenMode::OpenOrCreateReadWrite, options);
+  FFED_REQUIRE(reopened.has_value());
+  FFED_CHECK_EQ(reopened.value().recovery().outcome, RecoveryOutcome::Clean);
+  FFED_CHECK(reopened.value().recovery().writable);
+  FFED_CHECK_EQ(reopened.value().recovery().record_count, std::size_t{8});
+}
+
+FFED_TEST(journal, a_coordinator_restarts_however_often_its_clock_was_advanced) {
+  // Every advance of the logical clock, every restart and every reachability report adds a
+  // record, and only the latest of each matters. A journal near its record bound must neither
+  // stop the coordinator from recording nor stop it from starting again.
+  Scratch scratch;
+  const auto path = scratch.file("long-lived.fedjournal");
+  const FederationFixture fixture;
+  {
+    auto coordinator = make_coordinator(fixture, path);
+    FFED_REQUIRE(coordinator.has_value());
+    FFED_REQUIRE(coordinator.value()->stop().ok());
+  }
+  const std::size_t bound = JournalOptions{}.max_records;
+  std::uint64_t tick = 100;
+  {
+    // The history a long-lived coordinator leaves behind: the records of the federation itself,
+    // followed by one clock record after another, up to just below the bound.
+    auto journal = Journal::open(path, JournalOpenMode::OpenOrCreateReadWrite);
+    FFED_REQUIRE(journal.has_value());
+    auto records = journal.value().load(bound, kMaxJournalRecordBytes);
+    FFED_REQUIRE(records.has_value());
+    std::vector<JournalRecord> history = records.value();
+    while (history.size() + 8 < bound) {
+      Writer writer;
+      FFED_REQUIRE(writer.u64(++tick).ok());
+      JournalRecord record;
+      record.type = JournalRecordType::TickHighWater;
+      record.payload.assign(writer.span().begin(), writer.span().end());
+      history.push_back(std::move(record));
+    }
+    FFED_REQUIRE(journal.value().compact(history).ok());
+    FFED_REQUIRE(journal.value().close().ok());
+  }
+  Incarnation before;
+  {
+    auto coordinator = make_coordinator(fixture, path);
+    FFED_REQUIRE(coordinator.has_value());
+    FFED_CHECK_EQ(coordinator.value()->logical_time().value(), tick);
+    before = coordinator.value()->incarnation();
+    for (int i = 0; i < 32; ++i) {
+      const Status advanced = coordinator.value()->advance_time(Tick(++tick));
+      FFED_CHECK_MSG(advanced.ok(), advanced.to_string());
+    }
+    FFED_REQUIRE(coordinator.value()->stop().ok());
+  }
+  auto restarted = make_coordinator(fixture, path);
+  FFED_CHECK_MSG(restarted.has_value(),
+                 restarted.has_value() ? std::string() : restarted.status().to_string());
+  if (restarted.has_value()) {
+    FFED_CHECK_EQ(restarted.value()->logical_time().value(), tick);
+    FFED_CHECK(restarted.value()->incarnation().value() == before.value() + 1u);
+    FFED_CHECK_EQ(restarted.value()->stats().active_members, std::uint64_t{1});
+  }
+}
+
 FFED_TEST_MAIN()

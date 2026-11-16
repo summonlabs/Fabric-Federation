@@ -664,6 +664,14 @@ Status Journal::append(const JournalRecord& record) {
   if (record.payload.size() > options_.max_payload_bytes) {
     return Status::make(ErrorCode::BoundsExceeded, "record payload exceeds the configured bound");
   }
+  // Recovery refuses a journal that holds more records than the bound, so the
+  // bound is enforced here as well. Without it the runtime could write a
+  // journal that it would not open again.
+  if (recovery_.record_count >= options_.max_records) {
+    return Status::make(ErrorCode::CapacityExceeded,
+                        "appending would exceed the configured journal record bound; compact the "
+                        "journal before writing more");
+  }
   JournalRecord stored = record;
   stored.sequence = next_sequence_;
   const std::vector<std::byte> bytes = make_record_bytes(stored);
@@ -681,6 +689,9 @@ Status Journal::append(const JournalRecord& record) {
     return Status::make(ErrorCode::IoError, "journal flush failed: " + error);
   }
   size_bytes_ = total;
+  // The record is part of the valid history this handle reports and reads back.
+  recovery_.good_bytes = total;
+  ++recovery_.record_count;
   if (!checked_inc_u64(next_sequence_)) {
     return Status::make(ErrorCode::Overflow, "journal sequence is exhausted");
   }

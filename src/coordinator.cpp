@@ -124,6 +124,8 @@ struct FederationCoordinator::Impl {
   std::deque<std::shared_ptr<Socket>> queue;
   std::mutex queue_mutex;
   std::condition_variable queue_cv;
+  // Connections a worker is serving right now. Guarded by queue_mutex.
+  std::size_t active_connections = 0;
   std::mutex sockets_mutex;
   std::vector<std::weak_ptr<Socket>> active_sockets;
   std::atomic<bool> stopping{false};
@@ -140,7 +142,10 @@ struct FederationCoordinator::Impl {
     tick = Tick(tick.value() + 1u);
     return issued;
   }
+  // Record count at which the journal is compacted next.
+  std::size_t journal_compact_at = JournalOptions{}.max_records / 2;
   [[nodiscard]] Status journal_append(JournalRecordType type, const Writer& writer);
+  [[nodiscard]] Status compact_journal_locked();
   [[nodiscard]] Result<FederationState> derive_locked() const;
   [[nodiscard]] Result<SubmissionOutcome> admit_locked(const Artifact& artifact);
   [[nodiscard]] Status record_decision_locked(const Artifact& artifact,
@@ -155,7 +160,81 @@ Status FederationCoordinator::Impl::journal_append(JournalRecordType type, const
   if (!durable) {
     return Status::success();
   }
+  if (journal.recovery().record_count >= journal_compact_at) {
+    // A failed compaction leaves the journal as it was; the append below
+    // reports whether the record itself could be written.
+    const Status compacted = compact_journal_locked();
+    (void)compacted;
+  }
   return journal.append(type, writer.span());
+}
+
+// Every advance of the logical clock, every start of the coordinator and every
+// reachability report appends a record, and recovery only uses the latest of
+// each. Left alone they fill the journal to its record bound, after which
+// nothing can be recorded and the journal is refused on the next start.
+// Compaction rewrites the journal with those records collapsed to their current
+// value. Every other record is kept as it is, in its original order.
+Status FederationCoordinator::Impl::compact_journal_locked() {
+  const std::size_t bound = JournalOptions{}.max_records;
+  const std::size_t before = journal.recovery().record_count;
+  // Whatever happens below, the next attempt waits for the journal to grow.
+  journal_compact_at = before + bound / 8;
+  auto loaded = journal.load(bound, kMaxJournalRecordBytes);
+  if (!loaded.has_value()) {
+    return loaded.status();
+  }
+  std::vector<JournalRecord> kept;
+  kept.reserve(loaded.value().size());
+  for (JournalRecord& record : loaded.value()) {
+    if (record.type == JournalRecordType::TickHighWater ||
+        record.type == JournalRecordType::CoordinatorIncarnation ||
+        record.type == JournalRecordType::PartitionObservation) {
+      continue;
+    }
+    kept.push_back(std::move(record));
+  }
+  for (const auto& entry : observations) {
+    Writer writer;
+    const Status encoded = entry.second.encode(writer);
+    if (!encoded.ok()) {
+      return encoded;
+    }
+    JournalRecord record;
+    record.type = JournalRecordType::PartitionObservation;
+    record.payload.assign(writer.span().begin(), writer.span().end());
+    kept.push_back(std::move(record));
+  }
+  {
+    Writer writer;
+    const Status encoded = writer.u64(tick.value());
+    if (!encoded.ok()) {
+      return encoded;
+    }
+    JournalRecord record;
+    record.type = JournalRecordType::TickHighWater;
+    record.payload.assign(writer.span().begin(), writer.span().end());
+    kept.push_back(std::move(record));
+  }
+  {
+    Writer writer;
+    const Status encoded = writer.u64(incarnation.value());
+    if (!encoded.ok()) {
+      return encoded;
+    }
+    JournalRecord record;
+    record.type = JournalRecordType::CoordinatorIncarnation;
+    record.payload.assign(writer.span().begin(), writer.span().end());
+    kept.push_back(std::move(record));
+  }
+  if (kept.size() >= before) {
+    return Status::success();  // nothing to gain
+  }
+  const Status compacted = journal.compact(kept);
+  if (compacted.ok()) {
+    journal_compact_at = std::max(bound / 2, journal.recovery().record_count + bound / 8);
+  }
+  return compacted;
 }
 
 Result<FederationState> FederationCoordinator::Impl::derive_locked() const {
@@ -339,6 +418,10 @@ Status FederationCoordinator::Impl::load_journal() {
   lease_sequence = highest_lease_sequence + 1u;
   if (fresh) {
     recovery_detail = "fresh journal created";
+  }
+  if (journal.recovery().record_count >= journal_compact_at) {
+    const Status compacted = compact_journal_locked();
+    (void)compacted;
   }
   Writer writer;
   if (!writer.u64(incarnation.value()).ok()) {
@@ -742,11 +825,13 @@ Status FederationCoordinator::start() {
     }
     impl.listener = std::move(listener.value());
     impl.stopping.store(false, std::memory_order_release);
-    impl.accept_thread = std::thread([this] { accept_loop(); });
-    impl.workers.reserve(impl.config.worker_threads);
+    // The accept thread adds workers as connections arrive, so the initial ones
+    // are in place before it starts.
+    impl.workers.reserve(impl.config.max_connections);
     for (std::size_t i = 0; i < impl.config.worker_threads; ++i) {
       impl.workers.emplace_back([this] { worker_loop(); });
     }
+    impl.accept_thread = std::thread([this] { accept_loop(); });
   }
   impl.started.store(true, std::memory_order_release);
   return Status::success();
@@ -900,21 +985,31 @@ Result<AuthorityLease> FederationCoordinator::issue_lease(const LeaseRequest& re
   }
 
   AuthorityLease lease;
-  const Digest id_digest = digest_of([&](Writer& writer) {
-    Status status = writer.id16(impl.config.federation.bytes());
-    if (!status.ok()) {
-      return status;
+  // The identifier is derived from a counter that a restart re-seeds from the
+  // journal. A compacted journal can seed it lower than before, so a counter
+  // value whose identifier is already taken is skipped: a new lease never
+  // replaces an existing one.
+  for (;;) {
+    const Digest id_digest = digest_of([&](Writer& writer) {
+      Status status = writer.id16(impl.config.federation.bytes());
+      if (!status.ok()) {
+        return status;
+      }
+      return writer.u64(impl.lease_sequence);
+    });
+    if (id_digest.is_zero()) {
+      return Status::make(ErrorCode::Internal, "the lease identifier cannot be derived");
     }
-    return writer.u64(impl.lease_sequence);
-  });
-  if (id_digest.is_zero()) {
-    return Status::make(ErrorCode::Internal, "the lease identifier cannot be derived");
+    std::array<std::uint8_t, 16> id_bytes{};
+    for (std::size_t i = 0; i < id_bytes.size(); ++i) {
+      id_bytes[i] = id_digest.bytes()[i];
+    }
+    lease.id = LeaseId::from_bytes(id_bytes);
+    if (impl.leases.find(lease.id) == impl.leases.end()) {
+      break;
+    }
+    ++impl.lease_sequence;
   }
-  std::array<std::uint8_t, 16> id_bytes{};
-  for (std::size_t i = 0; i < id_bytes.size(); ++i) {
-    id_bytes[i] = id_digest.bytes()[i];
-  }
-  lease.id = LeaseId::from_bytes(id_bytes);
   lease.federation = impl.config.federation;
   lease.holder = member->current_identity;
   lease.scopes = request.scopes;
@@ -1385,12 +1480,21 @@ void FederationCoordinator::accept_loop() {
     auto socket = std::make_shared<Socket>(std::move(accepted.value()));
     {
       std::lock_guard<std::mutex> lock(impl.queue_mutex);
-      if (impl.queue.size() >= impl.config.max_pending_connections) {
-        // The queue is full: the connection is closed immediately rather than
-        // letting the backlog grow without bound.
+      if (impl.queue.size() >= impl.config.max_pending_connections ||
+          impl.active_connections + impl.queue.size() >= impl.config.max_connections) {
+        // The connection bound is reached: the connection is closed immediately
+        // rather than letting the backlog grow without bound.
         continue;
       }
       impl.queue.push_back(std::move(socket));
+      // A worker serves one connection for as long as it stays open, and a
+      // member keeps its connection for as long as it runs. With a fixed number
+      // of workers, that many connected members kept every later connection
+      // waiting for a welcome that never came. A worker is added whenever every
+      // existing one is taken, up to the connection bound.
+      if (impl.active_connections + impl.queue.size() > impl.workers.size()) {
+        impl.workers.emplace_back([this] { worker_loop(); });
+      }
     }
     impl.queue_cv.notify_one();
   }
@@ -1413,9 +1517,14 @@ void FederationCoordinator::worker_loop() {
       }
       socket = impl.queue.front();
       impl.queue.pop_front();
+      ++impl.active_connections;
     }
     if (socket) {
       serve(socket);
+    }
+    {
+      std::lock_guard<std::mutex> lock(impl.queue_mutex);
+      --impl.active_connections;
     }
   }
 }
