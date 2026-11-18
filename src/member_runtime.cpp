@@ -3,6 +3,7 @@
 #include "fabric_federation/member_runtime.hpp"
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 
 #include "fabric_federation/protocol.hpp"
@@ -61,6 +62,12 @@ struct MemberFabricRuntime::Impl {
   std::thread probe_thread;
   std::atomic<bool> probe_stopping{false};
   bool probe_open = false;
+  // Guards what the probe thread shares with the thread that owns the runtime:
+  // the connection it is answering, so that a stop can end a read that waits
+  // on a prober which sent nothing, and the coordinator client it reports
+  // from, which attach() and detach() replace.
+  std::mutex probe_mutex;
+  Socket* probe_peer = nullptr;
   // The port the probe listener actually bound. When the configuration asks for
   // an ephemeral port, the first bind chooses one and later binds reuse it, so
   // closing and reopening the listener does not silently move the endpoint that
@@ -128,9 +135,12 @@ Status MemberFabricRuntime::attach() {
   if (!client.has_value()) {
     return client.status();
   }
-  impl.client = std::move(client.value());
-  impl.attached = true;
-  impl.tick = impl.client.welcome().logical_time;
+  {
+    std::lock_guard<std::mutex> lock(impl.probe_mutex);
+    impl.client = std::move(client.value());
+    impl.attached = true;
+    impl.tick = impl.client.welcome().logical_time;
+  }
   impl.epoch = impl.epoch;
   const Status refreshed = refresh_clock(impl.client, impl.tick, impl.epoch, impl.clock_current);
   if (!refreshed.ok()) {
@@ -147,6 +157,7 @@ Status MemberFabricRuntime::detach() {
   if (!impl.attached) {
     return Status::success();
   }
+  std::lock_guard<std::mutex> lock(impl.probe_mutex);
   impl.attached = false;
   return impl.client.close();
 }
@@ -718,32 +729,49 @@ Status MemberFabricRuntime::start_probe_listener() {
       if (!accepted.has_value()) {
         break;
       }
-      auto request = read_message(accepted.value());
-      if (!request.has_value() || request.value().type != MessageType::ProbeRequest) {
-        continue;
+      Socket& peer = accepted.value();
+      {
+        std::lock_guard<std::mutex> lock(state.probe_mutex);
+        if (state.probe_stopping.load(std::memory_order_acquire)) {
+          break;
+        }
+        state.probe_peer = &peer;
       }
-      auto hello = decode_payload<HelloRequest>(request.value().span());
-      if (!hello.has_value() || hello.value().federation != state.config.federation) {
-        continue;
-      }
-      ProbeResponse response;
-      response.federation = state.config.federation;
-      response.member = state.config.constitution.member;
-      response.incarnation = state.config.incarnation;
-      response.node = state.config.node;
-      response.logical_time = state.tick;
-      response.constitution = state.config.constitution.digest();
-      if (state.attached) {
-        response.epoch = state.client.welcome().epoch;
-      }
-      Writer writer;
-      if (response.encode(writer).ok()) {
-        const Status status =
-            write_message(accepted.value(), MessageType::ProbeResult, writer.span());
-        (void)status;
-      }
-      const Status shutdown = accepted.value().shutdown_send();
-      (void)shutdown;
+      // The prober's request is read with no bound; stop_probe_listener() ends
+      // the read through probe_peer.
+      const auto answer = [&state, &peer] {
+        auto request = read_message(peer);
+        if (!request.has_value() || request.value().type != MessageType::ProbeRequest) {
+          return;
+        }
+        auto hello = decode_payload<HelloRequest>(request.value().span());
+        if (!hello.has_value() || hello.value().federation != state.config.federation) {
+          return;
+        }
+        ProbeResponse response;
+        response.federation = state.config.federation;
+        response.member = state.config.constitution.member;
+        response.incarnation = state.config.incarnation;
+        response.node = state.config.node;
+        response.constitution = state.config.constitution.digest();
+        {
+          std::lock_guard<std::mutex> lock(state.probe_mutex);
+          response.logical_time = state.tick;
+          if (state.attached) {
+            response.epoch = state.client.welcome().epoch;
+          }
+        }
+        Writer writer;
+        if (response.encode(writer).ok()) {
+          const Status status = write_message(peer, MessageType::ProbeResult, writer.span());
+          (void)status;
+        }
+        const Status shutdown = peer.shutdown_send();
+        (void)shutdown;
+      };
+      answer();
+      std::lock_guard<std::mutex> lock(state.probe_mutex);
+      state.probe_peer = nullptr;
     }
   });
   return Status::success();
@@ -758,6 +786,15 @@ Status MemberFabricRuntime::stop_probe_listener() {
   impl.probe_stopping.store(true, std::memory_order_release);
   const Status closed = impl.probe_listener.close();
   (void)closed;
+  {
+    // The probe thread may be reading from a prober that connected and sent
+    // nothing. End that read, or the join below would wait on the prober.
+    std::lock_guard<std::mutex> lock(impl.probe_mutex);
+    if (impl.probe_peer != nullptr) {
+      const Status ended = impl.probe_peer->shutdown_both();
+      (void)ended;
+    }
+  }
   if (impl.probe_thread.joinable()) {
     impl.probe_thread.join();
   }

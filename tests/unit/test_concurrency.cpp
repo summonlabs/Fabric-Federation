@@ -16,6 +16,7 @@
 
 #include "fixture.hpp"
 #include "fabric_federation/client.hpp"
+#include "fabric_federation/member_runtime.hpp"
 #include "fabric_federation/net.hpp"
 #include "test_harness.hpp"
 
@@ -388,6 +389,55 @@ FFED_TEST(concurrency, stopping_does_not_wait_for_a_silent_client) {
   stopper.join();
   FFED_CHECK(prompt);
   FFED_CHECK(!coordinator.value()->running());
+}
+
+// Regression: the probe thread reads a prober's request with no bound, and
+// stop_probe_listener() joins that thread. A prober that connected and sent
+// nothing kept the stop, and with it the runtime's destructor, waiting on it.
+FFED_TEST(concurrency, stopping_the_probe_listener_does_not_wait_on_a_silent_prober) {
+  const FederationFixture fixture;
+  const FixtureMember member = make_member("probe-stop", 1);
+  MemberConfig config;
+  config.federation = fixture.federation;
+  config.constitution = member.constitution;
+  config.node = member.node;
+  config.incarnation = member.incarnation;
+  auto runtime = MemberFabricRuntime::create(config);
+  FFED_REQUIRE(runtime.has_value());
+  FFED_REQUIRE(runtime.value()->start_probe_listener().ok());
+  Endpoint endpoint;
+  endpoint.port = runtime.value()->probe_port();
+
+  // One answered probe proves the probe thread is running and is back in its
+  // accept, so the silent connection that follows is the one it picks up.
+  const MemberObservation observed =
+      runtime.value()->probe_peers({MemberFabricRuntime::PeerTarget{member.member, endpoint}});
+  auto silent = Socket::connect(endpoint);
+
+  std::mutex mutex;
+  std::condition_variable changed;
+  bool stopped = false;
+  std::thread stopper([&] {
+    const Status status = runtime.value()->stop_probe_listener();
+    (void)status;
+    std::lock_guard<std::mutex> lock(mutex);
+    stopped = true;
+    changed.notify_all();
+  });
+  bool prompt = false;
+  {
+    std::unique_lock<std::mutex> lock(mutex);
+    prompt = changed.wait_for(lock, std::chrono::seconds(10), [&] { return stopped; });
+  }
+  // A stop that was still waiting for the prober is released by the prober going away.
+  if (silent.has_value()) {
+    const Status closed = silent.value().close();
+    (void)closed;
+  }
+  stopper.join();
+  FFED_CHECK(!observed.peers.empty());
+  FFED_CHECK(silent.has_value());
+  FFED_CHECK(prompt);
 }
 
 FFED_TEST_MAIN()
