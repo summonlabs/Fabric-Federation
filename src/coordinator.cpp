@@ -857,6 +857,11 @@ Status FederationCoordinator::stop() {
   // blocked in a read returns instead of waiting forever. No lock is held
   // while the sockets are shut down and no thread is joined while holding the
   // state mutex.
+  // A worker tests the stop flag under queue_mutex before it waits. Passing
+  // through that mutex after the flag is set keeps the notification from
+  // falling between a worker's test and its wait, where it was lost and the
+  // worker was joined forever.
+  { std::lock_guard<std::mutex> queue_lock(impl.queue_mutex); }
   impl.queue_cv.notify_all();
   shutdown_connections();
   impl.queue_cv.notify_all();
